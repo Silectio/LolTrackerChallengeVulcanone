@@ -1,3 +1,5 @@
 streamlit
 requests
 psycopg2-binary
+pandas
+altair

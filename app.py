@@ -1,10 +1,11 @@
 import streamlit as st
 import requests
 import os
-
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 import psycopg2
+import pandas as pd
+import altair as alt
 
 api_key = st.secrets.get("api_key")
 
@@ -38,6 +39,19 @@ def get_db_conn():
             )
             """
         )
+        cur.execute(
+            """
+            create table if not exists snapshots (
+                id bigserial primary key,
+                game_name text not null,
+                tag text not null,
+                tier text not null,
+                rank text not null,
+                lp int not null,
+                created_at timestamptz not null default now()
+            )
+            """
+        )
     conn.commit()
     return conn
 
@@ -65,6 +79,30 @@ def db_delete_player(conn, game_name, tag):
             "delete from players where game_name=%s and tag=%s", (game_name, tag)
         )
     conn.commit()
+
+
+def db_insert_snapshot(conn, game_name, tag, tier, rank, lp, created_at=None):
+    ts = created_at or datetime.now(timezone.utc)
+    with conn.cursor() as cur:
+        cur.execute(
+            "insert into snapshots (game_name, tag, tier, rank, lp, created_at) values (%s, %s, %s, %s, %s, %s)",
+            (game_name, tag, tier, rank, int(lp), ts),
+        )
+    conn.commit()
+
+
+def db_get_snapshots(conn, game_name=None, tag=None):
+    with conn.cursor() as cur:
+        if game_name and tag:
+            cur.execute(
+                "select game_name, tag, tier, rank, lp, created_at from snapshots where game_name=%s and tag=%s order by created_at asc",
+                (game_name, tag),
+            )
+        else:
+            cur.execute(
+                "select game_name, tag, tier, rank, lp, created_at from snapshots order by created_at asc"
+            )
+        return cur.fetchall()
 
 
 def get_account_by_riot_id(game_name, tag_line, show_errors=True):
@@ -215,88 +253,21 @@ def display_player_compact(player_data):
         st.markdown(f"{games} games")
 
 
-st.sidebar.header("🎯 Mode")
-mode = st.sidebar.radio(
-    "Sélectionnez un mode:",
-    ["🔍 Recherche individuelle", "👥 Liste de joueurs"],
-    label_visibility="collapsed",
-)
-st.sidebar.markdown("---")
-
-if mode == "🔍 Recherche individuelle":
-    st.sidebar.header("🔍 Recherche de joueur")
-    if not api_key:
-        st.sidebar.error("⚠️ Clé API manquante dans les secrets.")
-    else:
-        st.sidebar.success("✅ Clé API chargée")
-
-    with st.sidebar.form("search_form"):
-        game_name = st.text_input(
-            "Nom du joueur", value="Silectio", help="Entrez le nom du joueur (gameName)"
-        )
-        tag_line = st.text_input(
-            "Tag", value="EUW", help="Entrez le tag du joueur (sans le #)"
-        )
-        submit_button = st.form_submit_button("🔍 Rechercher", use_container_width=True)
-
-    if submit_button and game_name and tag_line:
-        if not api_key:
-            st.error("❌ Veuillez configurer votre clé API avant de continuer.")
-        else:
-            with st.spinner(f"🔄 Recherche de {game_name}#{tag_line}..."):
-                account_data = get_account_by_riot_id(game_name, tag_line)
-
-                if account_data:
-                    puuid = account_data.get("puuid")
-                    display_name = account_data.get("gameName", game_name)
-                    display_tag = account_data.get("tagLine", tag_line)
-
-                    st.success(f"✅ Joueur trouvé: **{display_name}#{display_tag}**")
-
-                    st.markdown("---")
-                    with st.spinner("🔄 Récupération des rangs..."):
-                        league_entries = get_league_entries_by_puuid(puuid)
-
-                        if league_entries is not None:
-                            if len(league_entries) == 0:
-                                st.info(
-                                    "ℹ️ Ce joueur n'a pas encore de classement cette saison."
-                                )
-                            else:
-                                st.subheader(f"📊 Classements de {display_name}")
-                                titles = [
-                                    str(
-                                        format_queue_type(
-                                            e.get("queueType") or "Unknown"
-                                        )
-                                    )
-                                    for e in league_entries
-                                ]
-                                tabs = st.tabs(titles)
-                                for t, entry in zip(tabs, league_entries):
-                                    with t:
-                                        display_rank_info(entry)
-    elif not game_name or not tag_line:
-        st.info(
-            "👈 Entrez un nom de joueur et un tag dans la barre latérale pour commencer."
-        )
-
-else:  # Mode Liste de joueurs
-    st.sidebar.header("👥 Gestion de la liste")
-    conn = get_db_conn()
-    if conn is None:
-        st.sidebar.error("⚠️ DATABASE_URL manquant dans les secrets/environnement.")
-        st.stop()
-    if "players_list" not in st.session_state:
-        rows = db_list_players(conn)
-        st.session_state.players_list = [
-            {
-                "game_name": r[0],
-                "tag": r[1],
-                "added_date": r[2].isoformat() if r[2] else None,
-            }
-            for r in rows
-        ]
+st.sidebar.header("👥 Gestion de la liste")
+conn = get_db_conn()
+if conn is None:
+    st.sidebar.error("⚠️ DATABASE_URL manquant dans les secrets/environnement.")
+    st.stop()
+if "players_list" not in st.session_state:
+    rows = db_list_players(conn)
+    st.session_state.players_list = [
+        {
+            "game_name": r[0],
+            "tag": r[1],
+            "added_date": r[2].isoformat() if r[2] else None,
+        }
+        for r in rows
+    ]
 
     if not api_key:
         st.sidebar.error("⚠️ Clé API manquante dans les secrets.")
@@ -335,7 +306,7 @@ else:  # Mode Liste de joueurs
     st.sidebar.markdown("---")
 
     if st.sidebar.button(
-        "🔄 Rafraîchir tous les rangs", use_container_width=True, type="primary"
+        "🔄 Rafraîchir et snapshot", use_container_width=True, type="primary"
     ):
         st.session_state.refresh_requested = True
 
@@ -370,6 +341,29 @@ else:  # Mode Liste de joueurs
 
                     if league_entries is not None:
                         rank_info = get_main_rank(league_entries)
+                        tier_str = (
+                            rank_info[0].split()[0]
+                            if rank_info[0] != "Unranked"
+                            else "UNRANKED"
+                        )
+                        rank_div = (
+                            rank_info[0].split()[1]
+                            if rank_info[0] != "Unranked"
+                            and len(rank_info[0].split()) > 1
+                            else ""
+                        )
+                        lp_val = rank_info[1]
+                        try:
+                            db_insert_snapshot(
+                                conn,
+                                player["game_name"],
+                                player["tag"],
+                                tier_str,
+                                rank_div,
+                                lp_val,
+                            )
+                        except Exception:
+                            pass
 
                         players_data.append(
                             {
@@ -418,6 +412,72 @@ else:  # Mode Liste de joueurs
             )
 
         st.markdown("---")
+        # Tableau récap évolutions
+        try:
+            snaps = db_get_snapshots(conn)
+            df = pd.DataFrame(
+                snaps, columns=["game_name", "tag", "tier", "rank", "lp", "created_at"]
+            )
+            if not df.empty:
+                latest = (
+                    df.sort_values("created_at").groupby(["game_name", "tag"]).tail(1)
+                )
+                daily = df.copy()
+                daily["date"] = daily["created_at"].dt.date
+                daily_agg = (
+                    daily.groupby(["game_name", "tag", "date"])
+                    .agg(lp=("lp", "max"))
+                    .reset_index()
+                )
+                daily_delta = (
+                    daily_agg.sort_values(["game_name", "tag", "date"])
+                    .groupby(["game_name", "tag"])
+                    .lp.diff()
+                )
+                daily_agg["lp_diff"] = daily_delta.fillna(0)
+                daily_mean = (
+                    daily_agg.groupby(["game_name", "tag"])
+                    .lp_diff.mean()
+                    .reset_index()
+                    .rename(columns={"lp_diff": "lp_diff_day_avg"})
+                )
+                week = df.copy()
+                week["week"] = week["created_at"].dt.isocalendar().week
+                week_agg = (
+                    week.groupby(["game_name", "tag", "week"])
+                    .agg(lp=("lp", "max"))
+                    .reset_index()
+                )
+                week_delta = (
+                    week_agg.sort_values(["game_name", "tag", "week"])
+                    .groupby(["game_name", "tag"])
+                    .lp.diff()
+                )
+                week_agg["lp_diff"] = week_delta.fillna(0)
+                week_mean = (
+                    week_agg.groupby(["game_name", "tag"])
+                    .lp_diff.mean()
+                    .reset_index()
+                    .rename(columns={"lp_diff": "lp_diff_week_avg"})
+                )
+                summary = latest.merge(
+                    daily_mean, on=["game_name", "tag"], how="left"
+                ).merge(week_mean, on=["game_name", "tag"], how="left")
+                summary = summary[
+                    [
+                        "game_name",
+                        "tag",
+                        "tier",
+                        "rank",
+                        "lp",
+                        "lp_diff_day_avg",
+                        "lp_diff_week_avg",
+                    ]
+                ]
+                st.subheader("📈 Évolution LP (récap)")
+                st.dataframe(summary.fillna(0), use_container_width=True)
+        except Exception:
+            pass
 
         if st.session_state.get("players_data"):
             tier_order = {
@@ -445,50 +505,21 @@ else:  # Mode Liste de joueurs
                 ),
                 reverse=True,
             )
-            col1, col2, col3, col4, col5, col6 = st.columns([3, 2, 1, 1, 1, 1])
-            with col1:
-                st.markdown("**👤 Joueur**")
-            with col2:
-                st.markdown("**🏆 Rang**")
-            with col3:
-                st.markdown("**💎 LP**")
-            with col4:
-                st.markdown("**📊 WR**")
-            with col5:
-                st.markdown("**🎮 Games**")
-            with col6:
-                st.markdown("**⚙️**")
-
-            st.markdown("---")
+            st.subheader("👥 Joueurs")
+            cols = st.columns(5)
             for idx, player in enumerate(sorted_players):
                 if player.get("status") == "success":
                     name = player.get("display_name", "N/A")
                     tag = player.get("display_tag", "N/A")
-                    rank, lp, winrate, games = player.get(
-                        "rank_info", ("Unranked", 0, 0, 0)
-                    )
-
-                    col1, col2, col3, col4, col5, col6 = st.columns([3, 2, 1, 1, 1, 1])
-
-                    with col1:
+                    col = cols[idx % 5]
+                    with col:
                         if st.button(
                             f"{name}#{tag}",
                             key=f"player_{idx}",
                             use_container_width=True,
                         ):
                             st.session_state.selected_player = player
-                    with col2:
-                        tier = rank.split()[0] if rank != "Unranked" else "Unranked"
-                        emoji = get_rank_emoji(tier.upper())
-                        st.markdown(f"{emoji} {rank}")
-                    with col3:
-                        st.markdown(f"**{lp}**")
-                    with col4:
-                        st.markdown(f"**{winrate:.0f}%**")
-                    with col5:
-                        st.markdown(f"{games}")
-                    with col6:
-                        if st.button("🗑️", key=f"delete_{idx}", help="Supprimer"):
+                        if st.button("🗑️", key=f"delete_{idx}"):
                             db_delete_player(conn, player["game_name"], player["tag"])
                             rows = db_list_players(conn)
                             st.session_state.players_list = [
@@ -510,13 +541,10 @@ else:  # Mode Liste de joueurs
                                 ]
                             st.rerun()
                 else:
-                    col1, col2, col3, col4, col5, col6 = st.columns([3, 2, 1, 1, 1, 1])
-                    with col1:
+                    col = cols[idx % 5]
+                    with col:
                         st.markdown(f"**{player['game_name']}#{player['tag']}**")
-                    with col2:
-                        st.markdown("❌ Erreur")
-                    with col6:
-                        if st.button("🗑️", key=f"delete_err_{idx}", help="Supprimer"):
+                        if st.button("🗑️", key=f"delete_err_{idx}"):
                             db_delete_player(conn, player["game_name"], player["tag"])
                             rows = db_list_players(conn)
                             st.session_state.players_list = [
@@ -533,22 +561,56 @@ else:  # Mode Liste de joueurs
                 st.markdown("---")
                 player = st.session_state.selected_player
                 st.subheader(
-                    f"📊 Détails de {player['display_name']}#{player['display_tag']}"
+                    f"📊 Évolution LP — {player['display_name']}#{player['display_tag']}"
                 )
-
-                league_entries = player.get("league_entries", [])
-
-                if len(league_entries) == 0:
-                    st.info("ℹ️ Ce joueur n'a pas encore de classement cette saison.")
-                else:
-                    titles = [
-                        str(format_queue_type(e.get("queueType") or "Unknown"))
-                        for e in league_entries
-                    ]
-                    tabs = st.tabs(titles)
-                    for t, entry in zip(tabs, league_entries):
-                        with t:
-                            display_rank_info(entry)
+                try:
+                    snaps = db_get_snapshots(conn, player["game_name"], player["tag"])
+                    dfp = pd.DataFrame(
+                        snaps,
+                        columns=[
+                            "game_name",
+                            "tag",
+                            "tier",
+                            "rank",
+                            "lp",
+                            "created_at",
+                        ],
+                    ).sort_values("created_at")
+                    if dfp.empty:
+                        st.info("Aucune donnée de snapshot pour ce joueur.")
+                    else:
+                        chart = (
+                            alt.Chart(dfp)
+                            .mark_line(point=True)
+                            .encode(
+                                x="created_at:T",
+                                y="lp:Q",
+                                tooltip=["created_at:T", "lp:Q", "tier:N", "rank:N"],
+                            )
+                            .properties(height=300)
+                        )
+                        st.altair_chart(chart, use_container_width=True)
+                        daily = dfp.copy()
+                        daily["date"] = daily["created_at"].dt.date
+                        daily_agg = (
+                            daily.groupby("date").agg(lp=("lp", "max")).reset_index()
+                        )
+                        daily_agg["lp_diff"] = daily_agg["lp"].diff().fillna(0)
+                        day_avg = daily_agg["lp_diff"].mean()
+                        week = dfp.copy()
+                        week["week"] = week["created_at"].dt.isocalendar().week
+                        week_agg = (
+                            week.groupby("week").agg(lp=("lp", "max")).reset_index()
+                        )
+                        week_agg["lp_diff"] = week_agg["lp"].diff().fillna(0)
+                        week_avg = week_agg["lp_diff"].mean()
+                        c1, c2 = st.columns(2)
+                        with c1:
+                            st.metric("Δ LP moyen par jour", f"{day_avg:.1f}")
+                        with c2:
+                            st.metric("Δ LP moyen par semaine", f"{week_avg:.1f}")
+                except Exception:
+                    st.warning("Impossible d’afficher le graphique pour ce joueur.")
         else:
             st.info(
                 "👆 Cliquez sur 'Rafraîchir tous les rangs' pour charger les données!"
